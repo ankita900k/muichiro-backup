@@ -1,0 +1,366 @@
+name: Muichiro PostgreSQL Daily Backup
+
+on:
+  schedule:
+    # Every day at 00:00 India Standard Time (18:30 UTC)
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muichiro-database-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    name: Create, encrypt and verify backup
+    runs-on: ubuntu-latest
+
+    container:
+      image: postgres:18-bookworm
+
+    env:
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+      BACKUP_ENCRYPTION_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Install backup dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 python3-venv gnupg ca-certificates
+
+          python3 -m venv /opt/backup-venv
+
+          /opt/backup-venv/bin/pip install \
+            --no-cache-dir \
+            google-api-python-client \
+            google-auth \
+            google-auth-httplib2
+
+      - name: Check PostgreSQL version and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pg_dump --version
+          pg_restore --version
+
+          test -n "$NEON_DATABASE_URL"
+          test -n "$GOOGLE_CLIENT_ID"
+          test -n "$GOOGLE_CLIENT_SECRET"
+          test -n "$GOOGLE_REFRESH_TOKEN"
+          test -n "$GOOGLE_DRIVE_FOLDER_ID"
+          test -n "$BACKUP_ENCRYPTION_PASSPHRASE"
+
+          echo "Required secrets are present."
+
+      - name: Create PostgreSQL backup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BACKUP_NAME="muichiro-$(date -u +%Y-%m-%d-%H%M%S).dump.gpg"
+
+          echo "BACKUP_NAME=$BACKUP_NAME" >> "$GITHUB_ENV"
+
+          pg_dump \
+            --format=custom \
+            --no-owner \
+            --no-acl \
+            --file="$RUNNER_TEMP/database.dump" \
+            "$NEON_DATABASE_URL"
+
+          test -s "$RUNNER_TEMP/database.dump"
+
+          echo "PostgreSQL dump created successfully."
+
+      - name: Encrypt backup with AES-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" \
+            > "$RUNNER_TEMP/backup-passphrase"
+
+          gpg --batch \
+            --yes \
+            --pinentry-mode loopback \
+            --passphrase-file "$RUNNER_TEMP/backup-passphrase" \
+            --symmetric \
+            --cipher-algo AES256 \
+            --output "$RUNNER_TEMP/$BACKUP_NAME" \
+            "$RUNNER_TEMP/database.dump"
+
+          test -s "$RUNNER_TEMP/$BACKUP_NAME"
+
+          rm -f "$RUNNER_TEMP/database.dump"
+
+          echo "Encrypted backup created."
+
+      - name: Upload, download and verify Google Drive backup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/drive_backup.py" <<'PYTHON'
+          import os
+          import subprocess
+          import io
+          from pathlib import Path
+
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.http import (
+              MediaFileUpload,
+              MediaIoBaseDownload,
+          )
+
+          SCOPES = [
+              "https://www.googleapis.com/auth/drive.file"
+          ]
+
+          def required(name):
+              value = os.environ.get(name)
+              if not value:
+                  raise RuntimeError(
+                      f"Missing environment variable: {name}"
+                  )
+              return value
+
+          client_id = required("GOOGLE_CLIENT_ID")
+          client_secret = required("GOOGLE_CLIENT_SECRET")
+          refresh_token = required("GOOGLE_REFRESH_TOKEN")
+          folder_id = required("GOOGLE_DRIVE_FOLDER_ID")
+          backup_name = required("BACKUP_NAME")
+
+          temp = Path(required("RUNNER_TEMP"))
+
+          backup_path = temp / backup_name
+          download_path = temp / "downloaded-backup.dump.gpg"
+          restored_path = temp / "verified-backup.dump"
+          passphrase_file = temp / "backup-passphrase"
+
+          if not backup_path.is_file() or backup_path.stat().st_size == 0:
+              raise RuntimeError(
+                  "Encrypted backup is missing or empty."
+              )
+
+          if not passphrase_file.is_file():
+              raise RuntimeError(
+                  "Encryption passphrase file is missing."
+              )
+
+          credentials = Credentials(
+              token=None,
+              refresh_token=refresh_token,
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=client_id,
+              client_secret=client_secret,
+              scopes=SCOPES,
+          )
+
+          credentials.refresh(Request())
+
+          service = build(
+              "drive",
+              "v3",
+              credentials=credentials,
+              cache_discovery=False,
+          )
+
+          # Upload as pending. It is not yet a verified backup.
+          uploaded = service.files().create(
+              body={
+                  "name": backup_name,
+                  "parents": [folder_id],
+                  "description": (
+                      "Encrypted Muichiro PostgreSQL backup"
+                  ),
+                  "appProperties": {
+                      "backup_status": "pending"
+                  },
+              },
+              media_body=MediaFileUpload(
+                  str(backup_path),
+                  mimetype="application/octet-stream",
+                  resumable=True,
+              ),
+              fields="id,name,createdTime,size",
+          ).execute()
+
+          file_id = uploaded["id"]
+
+          print("Encrypted backup uploaded.")
+
+          # Download the uploaded file.
+          request = service.files().get_media(
+              fileId=file_id
+          )
+
+          with io.FileIO(download_path, "wb") as output:
+              downloader = MediaIoBaseDownload(
+                  output,
+                  request
+              )
+
+              done = False
+
+              while not done:
+                  _, done = downloader.next_chunk()
+
+          # Compare the downloaded file with the original.
+          if backup_path.read_bytes() != download_path.read_bytes():
+              raise RuntimeError(
+                  "Downloaded backup does not match upload."
+              )
+
+          print("Downloaded backup matches uploaded backup.")
+
+          # Decrypt and verify GPG integrity.
+          with passphrase_file.open("rb") as passphrase:
+              subprocess.run(
+                  [
+                      "gpg",
+                      "--batch",
+                      "--yes",
+                      "--pinentry-mode",
+                      "loopback",
+                      "--passphrase-fd",
+                      "0",
+                      "--output",
+                      str(restored_path),
+                      "--decrypt",
+                      str(download_path),
+                  ],
+                  stdin=passphrase,
+                  check=True,
+              )
+
+          if not restored_path.is_file() or restored_path.stat().st_size == 0:
+              raise RuntimeError(
+                  "Decrypted PostgreSQL archive is empty."
+              )
+
+          # Check that PostgreSQL recognizes the archive.
+          subprocess.run(
+              [
+                  "pg_restore",
+                  "--list",
+                  str(restored_path),
+              ],
+              stdout=subprocess.DEVNULL,
+              check=True,
+          )
+
+          print(
+              "SUCCESS: Download, decryption and archive checks passed."
+          )
+
+          # Mark this backup verified only after all checks pass.
+          service.files().update(
+              fileId=file_id,
+              body={
+                  "appProperties": {
+                      "backup_status": "verified"
+                  }
+              },
+          ).execute()
+
+          print("Backup marked as verified.")
+
+          # List files in the backup folder.
+          query = (
+              f"'{folder_id}' in parents "
+              "and trashed = false"
+          )
+
+          results = []
+          page_token = None
+
+          while True:
+              response = service.files().list(
+                  q=query,
+                  pageSize=1000,
+                  orderBy="createdTime desc",
+                  pageToken=page_token,
+                  fields=(
+                      "nextPageToken,"
+                      "files(id,name,createdTime,appProperties)"
+                  ),
+              ).execute()
+
+              results.extend(response.get("files", []))
+
+              page_token = response.get("nextPageToken")
+
+              if not page_token:
+                  break
+
+          # Only verified Muichiro backups count.
+          backups = [
+              item for item in results
+              if item["name"].startswith("muichiro-")
+              and item["name"].endswith(".dump.gpg")
+              and item.get("appProperties", {}).get(
+                  "backup_status"
+              ) == "verified"
+          ]
+
+          backups.sort(
+              key=lambda item: item.get("createdTime", ""),
+              reverse=True,
+          )
+
+          # Never continue retention if the new backup is missing.
+          if not any(
+              item["id"] == file_id
+              for item in backups
+          ):
+              raise RuntimeError(
+                  "New verified backup is not visible in Drive. "
+                  "Retention cancelled."
+              )
+
+          # Keep the newest seven verified backups.
+          for old_backup in backups[7:]:
+              print(
+                  "Deleting old verified backup:",
+                  old_backup["name"],
+              )
+
+              service.files().delete(
+                  fileId=old_backup["id"]
+              ).execute()
+
+          print(
+              "Retention complete. "
+              "Up to seven verified backups retained."
+          )
+
+          PYTHON
+
+          /opt/backup-venv/bin/python \
+            "$RUNNER_TEMP/drive_backup.py"
+
+      - name: Clean up temporary backup files
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/database.dump"
+          rm -f "$RUNNER_TEMP/downloaded-backup.dump.gpg"
+          rm -f "$RUNNER_TEMP/verified-backup.dump"
+          rm -f "$RUNNER_TEMP/backup-passphrase"
+          rm -f "$RUNNER_TEMP"/muichiro-*.dump.gpg
